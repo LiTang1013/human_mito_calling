@@ -158,7 +158,7 @@ workflow AlignAndCall {
       compress = compress_output_vcf,
       m2_extra_filtering_args = m2_filter_extra_args,
       max_alt_allele_count = 4,
-      vaf_filter_threshold = 0,
+      vaf_filter_threshold = 0.01,
       blacklisted_sites = blacklisted_sites,
       blacklisted_sites_index = blacklisted_sites_index,
       f_score_beta = f_score_beta,
