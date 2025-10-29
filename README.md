@@ -144,5 +144,6 @@ The structure is:
 └── (Root Level - Stage 2 Hail Final Outputs)
     ├── coverage.mt                 # Hail Matrix Table for coverage
     ├── combined_variants.mt        # Merged, filtered VCF Matrix Table
-    └── final_annotated_results.mt  # Final annotated Matrix Table (primary output)
+    ├── final_combined.gVCF.vcf.gz  # Final combined VCF
+    └── final_annotated.vcf.gz      # Final annotated combined VCF
 ```
