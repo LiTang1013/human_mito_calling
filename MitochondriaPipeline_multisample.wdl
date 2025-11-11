@@ -16,7 +16,7 @@ workflow MitochondriaMultiSamplePipeline {
     File inputSamplesFile
 
     String contig_name = "chrM"
-    Float autosomal_coverage = 30
+    Float vaf_filter_threshold = 0.01
 
     String gatk
     String picard
@@ -59,7 +59,6 @@ workflow MitochondriaMultiSamplePipeline {
 
   parameter_meta {
     wgs_aligned_input_bam_or_cram: "Full WGS hg38 bam or cram"
-    autosomal_coverage: "Median coverage of full input bam"
     out_vcf: "Final VCF of mitochondrial SNPs and INDELs"
     vaf_filter_threshold: "Hard threshold for filtering low VAF sites"
     f_score_beta: "F-Score beta balances the filtering strategy between recall and precision. The relative weight of recall to precision."
@@ -92,11 +91,11 @@ workflow MitochondriaMultiSamplePipeline {
     call AlignAndCall.AlignAndCall as AlignAndCall {
       input:
         unmapped_bam = RevertSam.unmapped_bam,
-        autosomal_coverage = autosomal_coverage,
         base_name = base_name,
         picard = picard,
         gatk = gatk,
         haplocheckCLI = haplocheckCLI,
+        vaf_filter_threshold = vaf_filter_threshold,
         mt_dict = mt_dict,
         mt_fasta = mt_fasta,
         mt_fasta_index = mt_fasta_index,
@@ -153,23 +152,22 @@ workflow MitochondriaMultiSamplePipeline {
   }
 
   output {
-    #Array[File] subset_bam = SubsetBamToChrM.output_bam
-    #Array[File] subset_bam = SubsetBamToChrM.output_bam
-    #Array[File] subset_bai = SubsetBamToChrM.output_bai
-    #Array[File] mt_aligned_bam = AlignAndCall.mt_aligned_bam
-    #Array[File] mt_aligned_bai = AlignAndCall.mt_aligned_bai
-    #Array[File] duplicate_metrics = AlignAndCall.duplicate_metrics    
-    #Array[File] coverage_metrics = AlignAndCall.coverage_metrics
-    #Array[File] theoretical_sensitivity_metrics = AlignAndCall.theoretical_sensitivity_metrics
+    Array[File] subset_bam = SubsetBamToChrM.output_bam
+    Array[File] subset_bai = SubsetBamToChrM.output_bai
+    Array[File] mt_aligned_bam = AlignAndCall.mt_aligned_bam
+    Array[File] mt_aligned_bai = AlignAndCall.mt_aligned_bai
+    Array[File] duplicate_metrics = AlignAndCall.duplicate_metrics    
+    Array[File] coverage_metrics = AlignAndCall.coverage_metrics
+    Array[File] theoretical_sensitivity_metrics = AlignAndCall.theoretical_sensitivity_metrics
     #Array[Int] mean_coverage = AlignAndCall.mean_coverage
 
     Array[File] contamination_metrics = AlignAndCall.contamination_metrics
     #Array[Float] contamination = AlignAndCall.contamination
     #Array[String] major_haplogroup = AlignAndCall.major_haplogroup
 
-    #Array[File] input_vcf_for_haplochecker = AlignAndCall.input_vcf_for_haplochecker
-    #Array[File] out_vcf = AlignAndCall.out_vcf
-    #Array[File] out_vcf_index = AlignAndCall.out_vcf_index
+    Array[File] input_vcf_for_haplochecker = AlignAndCall.input_vcf_for_haplochecker
+    Array[File] out_vcf = AlignAndCall.out_vcf
+    Array[File] out_vcf_index = AlignAndCall.out_vcf_index
 
     Array[File] base_level_coverage_metrics = CoverageAtEveryBase.table
     Array[File] split_vcf = SplitMultiAllelicSites.split_vcf

@@ -9,7 +9,6 @@ workflow AlignAndCall {
 
   input {
     File unmapped_bam
-    Float? autosomal_coverage
     String base_name
 
     String picard
@@ -43,7 +42,6 @@ workflow AlignAndCall {
     Boolean compress_output_vcf
 
     Float? verifyBamID
-    Int? max_low_het_sites
     String? m2_extra_args
     String? m2_filter_extra_args
     Float? vaf_filter_threshold
@@ -158,7 +156,7 @@ workflow AlignAndCall {
       compress = compress_output_vcf,
       m2_extra_filtering_args = m2_filter_extra_args,
       max_alt_allele_count = 4,
-      vaf_filter_threshold = 0.01,
+      vaf_filter_threshold = vaf_filter_threshold,
       blacklisted_sites = blacklisted_sites,
       blacklisted_sites_index = blacklisted_sites_index,
       f_score_beta = f_score_beta,
@@ -206,38 +204,6 @@ workflow AlignAndCall {
       f_score_beta = f_score_beta
  }
 
-
-  if ( defined(autosomal_coverage) ) {
-    call FilterNuMTs {
-      input:
-        gatk = gatk,
-        filtered_vcf = FilterContamination.filtered_vcf,
-        filtered_vcf_index = FilterContamination.filtered_vcf_idx,
-        ref_fasta = mt_fasta,
-        ref_fai = mt_fasta_index,
-        ref_dict = mt_dict,
-        autosomal_coverage = autosomal_coverage,
-        compress = compress_output_vcf
-    }
-  }
-
-  File low_het_vcf = select_first([FilterNuMTs.numt_filtered_vcf, FilterContamination.filtered_vcf])
-  File low_het_vcf_index = select_first([FilterNuMTs.numt_filtered_vcf_idx, FilterContamination.filtered_vcf_idx])
-
-  call FilterLowHetSites {
-    input:
-      gatk = gatk,
-      filtered_vcf = low_het_vcf,
-      filtered_vcf_index = low_het_vcf_index,
-      ref_fasta = mt_fasta,
-      ref_fai = mt_fasta_index,
-      ref_dict = mt_dict,
-      max_low_het_sites = max_low_het_sites,
-      compress = compress_output_vcf,
-      base_name = base_name
-  }
-
-
   output {
     File mt_aligned_bam = AlignToMt.mt_aligned_bam
     File mt_aligned_bai = AlignToMt.mt_aligned_bai
@@ -253,8 +219,8 @@ workflow AlignAndCall {
     Float contamination = FilterContamination.contamination
 
     File input_vcf_for_haplochecker = SplitMultiAllelicsAndRemoveNonPassSites.vcf_for_haplochecker
-    File out_vcf = FilterLowHetSites.final_filtered_vcf
-    File out_vcf_index = FilterLowHetSites.final_filtered_vcf_idx
+    File out_vcf       = FilterContamination.filtered_vcf
+    File out_vcf_index = FilterContamination.filtered_vcf_idx
 
   }
 }
@@ -440,12 +406,10 @@ task Filter {
     File raw_vcf_index
     File raw_vcf_stats
     Boolean compress
-    Float? vaf_cutoff
     String base_name
 
     String? m2_extra_filtering_args
     Int max_alt_allele_count
-    Float? autosomal_coverage
     Float? vaf_filter_threshold
     Float? f_score_beta
 
@@ -605,75 +569,6 @@ task GetContamination {
     String minor_hg = read_string("minor_hg.txt")
     Float major_level = read_float("mean_het_major.txt")
     Float minor_level = read_float("mean_het_minor.txt")
-  }
-}
-
-task FilterNuMTs {
-  input {
-    String gatk
-    File ref_fasta
-    File ref_fai
-    File ref_dict
-    File filtered_vcf
-    File filtered_vcf_index
-    Float? autosomal_coverage
-    Boolean compress
-  }
-  
-  String basename = basename(filtered_vcf, ".vcf")
-  String output_vcf = basename + ".numt" + if compress then ".vcf.gz" else ".vcf"
-  String output_vcf_index = output_vcf + if compress then ".tbi" else ".idx"
-  
-  parameter_meta {
-    autosomal_coverage: "Median coverage of the autosomes for filtering potential polymorphic NuMT variants"
-  }
-
-  command {
-    set -e
-
-    java -Xmx4G -jar ~{gatk} NuMTFilterTool \
-      -R ~{ref_fasta} \
-      -V ~{filtered_vcf} \
-      -O ~{output_vcf} \
-      --autosomal-coverage ~{autosomal_coverage}
-  
-  }
-  output {
-    File numt_filtered_vcf = "~{output_vcf}"
-    File numt_filtered_vcf_idx = "~{output_vcf_index}"
-  }
-}
-
-task FilterLowHetSites {
-  input {
-    String gatk
-    File ref_fasta
-    File ref_fai
-    File ref_dict
-    File filtered_vcf
-    File filtered_vcf_index
-    String base_name
-    Int? max_low_het_sites
-    Boolean compress
-  }
-
-  String output_vcf = base_name + ".final" + if compress then ".vcf.gz" else ".vcf"
-  String output_vcf_index = output_vcf + if compress then ".tbi" else ".idx"
-  Int max_sites = select_first([max_low_het_sites, 3])
-  
-  command {
-    set -e
-
-    java -Xmx4G -jar ~{gatk} MTLowHeteroplasmyFilterTool \
-      -R ~{ref_fasta} \
-      -V ~{filtered_vcf} \
-      -O ~{output_vcf} \
-      --max-allowed-low-hets ~{max_sites}
-  
-  }
-  output {
-    File final_filtered_vcf = "~{output_vcf}"
-    File final_filtered_vcf_idx = "~{output_vcf_index}"
   }
 }
 

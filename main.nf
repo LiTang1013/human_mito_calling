@@ -1,437 +1,669 @@
 #!/usr/bin/env nextflow
 nextflow.enable.dsl=2
 
-// ====================================================================================
-//                                  PIPELINE HEADER
-// ====================================================================================
+import groovy.json.JsonBuilder
+
+// ======================================================================
+// HEADER
+// ======================================================================
 log.info """
 PIPELINE START
 =================================
 Input file:        ${params.input}
 Output directory:  ${params.outdir}
-Reference Genome:  ${params.ref_genome_fasta}
-WDL Script:        ${params.wdl_script ?: 'N/A'}
 =================================
 """
 
-// ====================================================================================
-//                                  INPUT CHANNELS
-// ====================================================================================
+// ======================================================================
+// TOP-LEVEL CHANNELS (avoid file() at operators here)
+// ======================================================================
 
-// Create a tuple for the reference genome, including the FASTA and all its indices
-ch_ref_genome_tuple = tuple( file(params.ref_genome_fasta), file("${params.ref_genome_fasta}.{amb,ann,bwt,pac,sa,fai}") )
-// Create a channel with just the reference FASTA file, needed for CRAM generation
-ch_fasta_only = Channel.value( ch_ref_genome_tuple[0] )
-// Channel for the Cromwell configuration file
-ch_cromwell_conf = file("${baseDir}/cromwell.conf")
-// Channel for the directory containing the custom Python/Hail scripts
-ch_hail_directory = file("${baseDir}/hail")
+// Pass the FASTA path as a value; each process will stage/index via `path(...)` itself.
+ch_ref_fasta_val = Channel.value(params.wdl_inputs.ref_fasta)
 
-// --- Channel for input samples ---
-// This channel reads the input TSV (sample_id \t fastq_url),
-// groups all URLs by sample_id, sorts them, and then creates
-// R1/R2 pairs. Finally, it flattens the list so that each
-// FASTQ pair is a separate emission, tagged with a unique 'pair_id'.
-// Output: [ [id: 'sample_A', pair_id: 0], 'url_R1', 'url_R2' ]
-//         [ [id: 'sample_A', pair_id: 1], 'url_R1_b', 'url_R2_b' ]
-ch_samples = Channel.fromPath(params.input)
-    .splitCsv(header: false, sep: '\t') 
-    .filter { row -> row.size() == 2 && row[0] && !row[0].trim().isEmpty() && row[1] && !row[1].trim().isEmpty() } // Filter malformed rows
-    .map { row -> tuple(row[0], row[1]) } // -> [sample_id, url]
-    .groupTuple() // -> [sample_id, [url1, url2, ...]]
-    .map { sample_id, urls_list ->
-        def meta = [id: sample_id]
-        def sorted_urls = urls_list.sort() // Sort to ensure R1/R2 alignment (assumes consistent naming)
-        if (sorted_urls.size() % 2 != 0) {
-            error "Sample ${meta.id} has an odd number of FASTQ files after grouping. Please check input file."
-        }
-        def fastq_pairs = []
-        for (int i = 0; i < sorted_urls.size(); i += 2) {
-            fastq_pairs.add([sorted_urls[i], sorted_urls[i+1]]) // Create [R1, R2] pairs
-        }
-        return [meta, fastq_pairs] // -> [meta, [[R1, R2], [R1_b, R2_b], ...]]
+// Preserve original tuple shape (ref_fasta, ref_prefix) if needed downstream.
+ch_ref_genome_tuple = ch_ref_fasta_val.map { rf -> tuple(rf, rf) }
+
+// FASTA only (e.g., used by samtools -T)
+ch_fasta_only = ch_ref_fasta_val
+
+// Cromwell config & Hail script directory
+ch_cromwell_conf  = Channel.fromPath("${baseDir}/cromwell.conf")
+ch_hail_directory = Channel.fromPath(params.hail_script)
+
+// Build input rows from a 2–3 column TSV: [sample_id, file1, file2]
+// FASTQ: R1/R2; CRAM: cram/crai; BAM: bam/(blank or index)
+// ---------- SAFE build of ch_input_rows ----------
+if( !params.input ) {
+    System.err.println("FATAL: Missing --input parameter.")
+    System.exit(1)
+}
+def _in = file(params.input)
+if( !_in.exists() ) {
+    System.err.println("FATAL: Input file does not exist: ${params.input}")
+    System.exit(1)
+}
+
+ch_input_rows = Channel
+    .fromPath(_in)
+    .splitCsv(header:false, sep:'\t')
+    .filter { row -> row && row.size() >= 2 && row[0] && row[0].trim() && row[1] }
+    .map { row ->
+        def meta = [ id: (row[0] as String) ]
+        def f1 = (row[1] as String)
+        def f2 = (row.size() > 2 ? (row[2] as String) : null)
+        def ft = f1.endsWith('.fastq.gz') || f1.endsWith('.fq.gz') ? 'FASTQ'
+               : f1.endsWith('.cram') ? 'CRAM'
+               : f1.endsWith('.bam')  ? 'BAM'
+               : 'UNKNOWN'
+        [ meta, ft, f1, f2 ]
     }
-    .flatMap { meta, fastq_pairs ->
-        // Emit one item per FASTQ pair, adding a unique pair_id
-        fastq_pairs.indexed().collect { i, pair -> [meta + [pair_id: i], pair[0], pair[1]] }
+    .groupTuple()
+    .map { meta, ft_list, f1_list, f2_list ->
+        def unique_types = ft_list.unique()
+        if( unique_types.size() > 1 )
+            error "Sample ${meta.id} contains mixed input file types: ${unique_types}."
+        def ft = unique_types[0]
+        if( ft == 'UNKNOWN' )
+            error "Sample ${meta.id} has unknown file type for ${f1_list[0]}"
+        if( ft in ['CRAM','BAM'] && f1_list.size() > 1 )
+            error "Sample ${meta.id} has ${ft} input but multiple files were listed. Provide ONE merged ${ft}."
+        if( ft == 'CRAM' && (!f2_list || !f2_list[0] || !f2_list[0].toString().trim()))
+            error "Sample ${meta.id} is CRAM input but missing CRAI in column 3."
+        def pairs = (0..<f1_list.size()).collect { i -> [ f1_list[i], (f2_list ? f2_list[i] : null) ] }
+        [ meta, ft, pairs ]
     }
 
-// ====================================================================================
-//                                    WORKFLOW
-// ====================================================================================
-workflow {
-    // 1. Download each FASTQ pair
-    DOWNLOAD_FASTQ(ch_samples) // Output: [meta (with pair_id), fq1, fq2]
+def ch_fastqs = ch_input_rows.filter { meta, ft, pairs -> ft == 'FASTQ' }
+def ch_crams  = ch_input_rows.filter { meta, ft, pairs -> ft == 'CRAM'  }
+def ch_bams   = ch_input_rows.filter { meta, ft, pairs -> ft == 'BAM'   }
 
-    // 2. Align pair to reference, output unsorted BAM
-    ALIGN_AND_UNSORT(DOWNLOAD_FASTQ.out, ch_ref_genome_tuple) // Output: [meta, unsorted_bam]
-
-    // 3. Sort BAM and convert to CRAM for each pair
-    SORT_AND_CONVERT_TO_CRAM(ALIGN_AND_UNSORT.out.unsorted_bam, ch_fasta_only) // Output: [meta, single_cram, single_crai]
-
-    // Prepare CRAM files for merging by grouping all pairs belonging to the same sample
-    ch_crams_to_merge = SORT_AND_CONVERT_TO_CRAM.out.single_cram
-        .map { meta, cram, crai -> [meta.id, [cram, crai]] } // Map to [sample_id, [cram, crai]]
-        .groupTuple() // Group by sample_id: [sample_id, [[cram1, crai1], [cram2, crai2], ...]]
-        .map { sample_id, cram_pair_list ->
-            def meta = [id: sample_id]
-            // Collect CRAMs and CRAIs into separate lists
-            def crams = cram_pair_list.collect { it[0] }
-            def crais = cram_pair_list.collect { it[1] }
-            return [meta, crams, crais] // Re-package as [meta, [cram1, ...], [crai1, ...]]
-        }
-
-    // 4. Merge all CRAMs for a sample into one final CRAM
-    MERGE_CRAMS(ch_crams_to_merge) // Output: [meta, merged_cram, merged_crai]
-
-    // 5. Downstream processes connect to the output of MERGE_CRAMS
-    GENERATE_CRAM_TSV(MERGE_CRAMS.out.merged_cram)
-    GENERATE_WDL_JSON(GENERATE_CRAM_TSV.out.tsv)
-    RUN_WDL_VARIANT_CALLING(GENERATE_WDL_JSON.out.json, ch_cromwell_conf)
-    ANNOTATE_INDIVIDUAL_VCF(RUN_WDL_VARIANT_CALLING.out.wdl_files, ch_hail_directory)
-}
-
-// --- Workflow-level event handlers for reporting ---
-workflow.onComplete {
-    log.info "Pipeline completed successfully. Output files are in: ${params.outdir}"
-}
-workflow.onError {
-    log.error """
-    ----------------------------------------------------
-    ERROR: Pipeline execution failed!
-    The last error message was: ${task.errorReport}
-    Process name:           ${task.name}
-    Process tag:            ${task.tag}
-    ----------------------------------------------------
-    """
-}
-
-// ====================================================================================
-//                                    PROCESSES
-// ====================================================================================
-
-process DOWNLOAD_FASTQ {
-    tag "Download for ${meta.id} (Pair ${meta.pair_id})"
-
-    // Publish downloaded FASTQs to results dir. 
-    // The local work-dir copy will be cleaned up by ALIGN_AND_UNSORT.
-    publishDir "${params.outdir}/${meta.id}/fastq", mode: 'copy' 
-
-    input:
-    tuple val(meta), val(url1), val(url2)
-    output:
-    tuple val(meta), path("${meta.id}_${meta.pair_id}_1.fastq.gz"), path("${meta.id}_${meta.pair_id}_2.fastq.gz")
-    script:
-    """
-    #!/bin/bash
-    set -e
-    # Wget download
-    wget --no-check-certificate -O "${meta.id}_${meta.pair_id}_1.fastq.gz" "${url1}"
-    wget --no-check-certificate -O "${meta.id}_${meta.pair_id}_2.fastq.gz" "${url2}"
-    """
-}
-
+// ======================================================================
+/*                              PROCESSES                               */
+// ======================================================================
 
 process ALIGN_AND_UNSORT {
-    tag "BWA-MEM on ${meta.id} (Pair ${meta.pair_id})"
+  tag "BWA-MEM on ${meta.id} (Pair ${meta.pair_id})"
+  label 'alignment_related'
 
-    // Resource request should match BWA-MEM itself, which is often lower than sorting
-    cpus 8 
-    memory '32 GB'
-    time '1 h'
+  input:
+  tuple val(meta), path(read1), path(read2)
+  val ref_fasta
 
-    input:
-    // Receives a single FASTQ pair
-    tuple val(meta), path(read1), path(read2)
-    tuple path(ref_fasta), path(bwa_indices)
-    
-    output:
-    // Output a single unsorted BAM file
-    tuple val(meta), path("${meta.id}_${meta.pair_id}.unsorted.bam"), emit: unsorted_bam 
-    
-    script:
-    // CRITICAL: Read Group ID must be unique. Use meta.id and pair_id combination.
-    def read_group_id = "${meta.id}_${meta.pair_id}" 
-    // Define the full read group string for BWA
-    def read_group = "\'@RG\\tID:${read_group_id}\\tSM:${meta.id}\\tPL:ILLUMINA\'"
-    """
-    #!/bin/bash
-    set -e
+  output:
+  tuple val(meta), path("${meta.id}_${meta.pair_id}.unsorted.bam"), emit: unsorted_bam
 
-    # Run alignment and pipe output to samtools to create an unsorted BAM
-    bwa mem -t ${task.cpus} -R ${read_group} ${ref_fasta} ${read1} ${read2} | \\
-    samtools view -@ ${task.cpus} -b -o ${meta.id}_${meta.pair_id}.unsorted.bam -
-    
-    # After successfully creating the BAM, delete the original FASTQ files (local work dir copy only)
-    rm ${read1} ${read2}
-    """
+  script:
+  def rgid = "${meta.id}_${meta.pair_id}"
+  def rg   = "'@RG\\tID:${rgid}\\tSM:${meta.id}\\tPL:ILLUMINA'"
+  """
+  #!/usr/bin/env bash
+  set -euo pipefail
+  bwa mem -t ${task.cpus} -R ${rg} ${ref_fasta} ${read1} ${read2} \\
+    | samtools view -@ ${task.cpus} -b -o ${meta.id}_${meta.pair_id}.unsorted.bam -
+  rm -f ${read1} ${read2}
+  """
 }
 
 process SORT_AND_CONVERT_TO_CRAM {
-    tag "Sort and CRAM for ${meta.id} (Pair ${meta.pair_id})"
+  tag "Sort & CRAM for ${meta.id} (Pair ${meta.pair_id})"
+  label 'alignment_related'
 
-    // Increased resources to potentially solve OOM (Out Of Memory) issues during sorting
-    cpus 16
-    memory '64 GB'
-    time '1 h'
-    
-    input:
-    // Receives a single unsorted BAM file
-    tuple val(meta), path(unsorted_bam)
-    path ref_fasta
-    
-    output:
-    // Output a single CRAM and its index
-    tuple val(meta), path("${meta.id}_${meta.pair_id}.cram"), path("${meta.id}_${meta.pair_id}.cram.crai"), emit: single_cram
-    
-    script:
-    // Groovy variable (used only for filename construction, not in Bash logic)
-    def unsorted_bam_filename = unsorted_bam.getName()
+  input:
+  tuple val(meta), path(unsorted_bam)
+  val ref_fasta
 
-    """
-    #!/bin/bash
-    set -e
-    
-    # 1. Define Bash variables for intermediate and final files
-    SORTED_BAM="${meta.id}_${meta.pair_id}.sorted.bam"
-    OUTPUT_CRAM="${meta.id}_${meta.pair_id}.cram"
+  output:
+  tuple val(meta), path("${meta.id}_${meta.pair_id}.cram"), path("${meta.id}_${meta.pair_id}.cram.crai"), emit: single_cram
 
-    # 2. Sort: Use samtools sort
-    # Note: We use the Nextflow-provided filename ${unsorted_bam_filename} here
-    samtools sort -@ ${task.cpus} -o \${SORTED_BAM} ${unsorted_bam_filename}
-    
-    # 3. Convert to CRAM format, using the reference fasta
-    samtools view -@ ${task.cpus} -T ${ref_fasta} -C -o \${OUTPUT_CRAM} \${SORTED_BAM}
+  script:
+  def ubam = unsorted_bam.getName()
+  """
+  set -euo pipefail
+  SORTED_BAM=\"${meta.id}_${meta.pair_id}.sorted.bam\"
+  OUTPUT_CRAM=\"${meta.id}_${meta.pair_id}.cram\"
 
-    # 4. Create CRAM index
-    samtools index \${OUTPUT_CRAM}
-
-    # 5. Cleanup: Delete intermediate files (unsorted and sorted BAMs)
-    rm ${unsorted_bam_filename} \${SORTED_BAM}
-    """
+  samtools sort -@ ${task.cpus} -o "\$SORTED_BAM" ${ubam}
+  samtools view -@ ${task.cpus} -T ${ref_fasta} -C -o "\$OUTPUT_CRAM" "\$SORTED_BAM"
+  samtools index "\$OUTPUT_CRAM"
+  rm -f "\$SORTED_BAM" "${ubam}"
+  """
 }
 
 process MERGE_CRAMS {
-    tag "Merge CRAMs for ${meta.id}"
+  tag "Merge CRAMs for ${meta.id}"
+  label 'alignment_related'
 
-    // Publish the final merged CRAM file for the sample
-    publishDir "${params.outdir}/${meta.id}/alignment", mode: 'copy', pattern: "*.{cram,crai}"
+  publishDir "${params.outdir}", mode:'copy', pattern: "*.{cram,crai}", saveAs: { fn -> "${meta.id}/alignment/${fn}" }
 
-    input:
-    // Receives a list of all CRAMs/CRAIs for this sample
-    tuple val(meta), path(crams), path(crais)
+  input:
+  tuple val(meta), path(crams), path(crais)
 
-    output:
-    // Output the merged CRAM and CRAI
-    tuple val(meta), path("${meta.id}.merged.cram"), path("${meta.id}.merged.cram.crai"), emit: merged_cram
+  output:
+  tuple val(meta), path("${meta.id}.merged.cram"), path("${meta.id}.merged.cram.crai"), emit: merged_cram
 
-    script:
-    // Join the file lists into space-separated strings for the command line
-    def cram_files = crams.join(' ')
-    def crai_files = crais.join(' ')
-
-    """
-    #!/bin/bash
-    set -e
-    
-    # 1. Define Bash variables, ensure output filename is correct
-    OUTPUT_CRAM="${meta.id}.merged.cram"
-
-    # 2. Use samtools merge to combine all CRAM files
-    # Note: -f forces overwrite, -O CRAM specifies output format
-    samtools merge -@ ${task.cpus} -f -O CRAM --output-fmt-option version=3.0 -o \${OUTPUT_CRAM} ${cram_files}
-
-    # 3. Create CRAM index for the merged file
-    samtools index \${OUTPUT_CRAM}
-    
-    # 4. Cleanup: Delete all original single-pair CRAM files and their indices
-    rm ${cram_files} ${crai_files}
-    """
+  script:
+  def cram_files = crams.join(' ')
+  def crai_files = crais.join(' ')
+  """
+  #!/usr/bin/env bash
+  set -euo pipefail
+  OUTPUT_CRAM="${meta.id}.merged.cram"
+  samtools merge -@ ${task.cpus} -f -O CRAM --output-fmt-option version=3.0 -o "\$OUTPUT_CRAM" ${cram_files}
+  samtools index "\$OUTPUT_CRAM"
+  rm -f ${cram_files} ${crai_files}
+  """
 }
 
-// ... (GENERATE_CRAM_TSV, GENERATE_WDL_JSON, RUN_WDL_VARIANT_CALLING, ANNOTATE_INDIVIDUAL_VCF processes remain unchanged)
+process CONVERT_BAM_TO_CRAM {
+  tag "Convert BAM to CRAM for ${meta.id}"
+  label 'alignment_related'
+
+  publishDir "${params.outdir}", mode:'copy', pattern:"*.{cram,crai}", saveAs: { fn -> "${meta.id}/alignment/${fn}" }
+
+  input:
+  tuple val(meta), path(input_bam)
+  val ref_fasta
+
+  output:
+  tuple val(meta), path("${meta.id}.merged.cram"), path("${meta.id}.merged.cram.crai"), emit: merged_cram
+
+  script:
+  """
+  #!/usr/bin/env bash
+  set -euo pipefail
+  OUTPUT_CRAM="\${meta.id}.merged.cram"
+  SORTED_BAM="\${meta.id}.sorted.bam"
+
+  samtools sort -@ ${task.cpus} -o "\$SORTED_BAM" ${input_bam}
+  samtools view -@ ${task.cpus} -T ${ref_fasta} -C -o "\$OUTPUT_CRAM" "\$SORTED_BAM"
+  samtools index "\$OUTPUT_CRAM"
+  rm -f "\$SORTED_BAM"
+  """
+}
 
 process GENERATE_CRAM_TSV {
-    tag "Generate CRAM TSV for ${meta.id}"
+  tag "CRAM TSV for ${meta.id}"
+  label 'generation_related'
 
-    // This TSV file is an input for the WDL pipeline
-    publishDir "${params.outdir}/${meta.id}/variant_calling/inputs", mode: 'copy'
-    input:
-    tuple val(meta), path(cram), path(crai)
-    output:
-    tuple val(meta), path("${meta.id}_cram_list.tsv"), emit: tsv
-    script:
-    """
-    # Get the full, absolute path of the files, required by WDL
-    cram_path=\$(readlink -f ${cram})
-    crai_path=\$(readlink -f ${crai})
-    # Create a tab-separated file listing the CRAM and its index
-    echo -e "\${cram_path}\\t\${crai_path}" > ${meta.id}_cram_list.tsv
-    """
+  input:
+  tuple val(meta), path(cram), path(crai)
+
+  output:
+  tuple val(meta), path("${meta.id}_cram_list.tsv"), emit: tsv
+
+  script:
+  """
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  # More tolerant existence check: target exists (-e) or is a symlink (-L)
+  if [[ ! -e "${cram}" && ! -L "${cram}" ]]; then
+    echo "[ERROR] CRAM path is neither existing nor a symlink: ${cram}" >&2
+    exit 2
+  fi
+  if [[ ! -e "${crai}" && ! -L "${crai}" ]]; then
+    echo "[ERROR] CRAI path is neither existing nor a symlink: ${crai}" >&2
+    exit 3
+  fi
+
+  # Resolve absolute paths: prefer readlink -f; fall back to Python if unavailable
+  abs_path() {
+    local p="\$1"
+    if readlink -f "\$p" >/dev/null 2>&1; then
+      readlink -f "\$p"
+    else
+      python - <<'PY' "\$p"
+import os, sys
+p = sys.argv[1]
+try:
+    print(os.path.realpath(p))
+except Exception:
+    print(os.path.abspath(p))
+PY
+    fi
+  }
+
+  cram_path=\$(abs_path "${cram}")
+  crai_path=\$(abs_path "${crai}")
+
+  echo -e "\${cram_path}\t\${crai_path}" > ${meta.id}_cram_list.tsv
+  echo "[OK] Wrote ${meta.id}_cram_list.tsv"
+  """
 }
 
-
 process GENERATE_WDL_JSON {
-    tag "Generate WDL JSON for ${meta.id}"
-    // This JSON file is the main input config for Cromwell
-    publishDir "${params.outdir}/${meta.id}/variant_calling/inputs", mode: 'copy'
+  tag "WDL JSON for ${meta.id}"
+  label 'generation_related'
 
-    input:
-    tuple val(meta), path(cram_tsv)
+  input:
+  tuple val(meta), path(cram_tsv)
 
-    output:
-    tuple val(meta), path("${meta.id}_wdl_inputs.json"), emit: json
+  output:
+  tuple val(meta), path("${meta.id}_wdl_inputs.json"), emit: json
 
-    script:
-    // 1. In Groovy, create a JSON template with a unique placeholder.
-    def json_content = new groovy.json.JsonBuilder()
-    // Add the WDL-specific pipeline namespace to each parameter key
-    def wdl_inputs = params.wdl_inputs.collectEntries { key, value ->
-        ["MitochondriaMultiSamplePipeline.${key}", value]
-    }
-    // The inputSamplesFile must be the absolute path generated in the bash script
-    wdl_inputs["MitochondriaMultiSamplePipeline.inputSamplesFile"] = "___TSV_PATH_PLACEHOLDER___"
-    json_content(wdl_inputs)
-    def json_string_template = json_content.toPrettyString()
-
-    """
-    #!/bin/bash
-    set -e
-
-    # 2. In Bash, get the absolute path of the TSV file.
-    TSV_PATH=\$(readlink -f ${cram_tsv})
-
-    # 3. Use 'printf' to create the JSON template string in a shell variable.
-    JSON_TEMPLATE=\$(printf '%s' '${json_string_template}')
-
-    # 4. Use 'sed' to replace the placeholder with the real absolute path and write to the file.
-    #    This is the most robust way to handle paths with special characters.
-    echo "\${JSON_TEMPLATE}" | sed "s|___TSV_PATH_PLACEHOLDER___|\${TSV_PATH}|g" > ${meta.id}_wdl_inputs.json
-    """
+  script:
+  // Build namespaced WDL inputs once, substituting the TSV path at runtime.
+  def wdl_inputs = params.wdl_inputs.collectEntries { k,v -> ["MitochondriaMultiSamplePipeline.${k}", v] }
+  wdl_inputs["MitochondriaMultiSamplePipeline.inputSamplesFile"] = "___TSV_PATH_PLACEHOLDER___"
+  def template = new JsonBuilder(wdl_inputs).toPrettyString()
+  """
+  #!/usr/bin/env bash
+  set -euo pipefail
+  TSV_PATH=\$(readlink -f ${cram_tsv})
+  JSON_TEMPLATE=\$(printf '%s' '${template}')
+  echo "\${JSON_TEMPLATE}" | sed "s|___TSV_PATH_PLACEHOLDER___|\${TSV_PATH}|g" > ${meta.id}_wdl_inputs.json
+  """
 }
 
 process RUN_WDL_VARIANT_CALLING {
-    tag "Variant Calling on ${meta.id}"
-    publishDir "${params.outdir}/${meta.id}/variant_calling/", mode: 'copy'
+  tag "Variant Calling ${meta.id}"
+  label 'wdl_related'
 
-    input:
-    tuple val(meta), path(wdl_inputs_json)
-    path cromwell_config
+  input:
+  tuple val(meta), path(wdl_inputs_json)
+  path cromwell_config
 
-    // We define two 'output' blocks to capture different sets of files
-    // 'wdl_results' captures the entire output directory (for debugging/archive)
-    output:
-    tuple val(meta), path("final_wdl_output"), emit: wdl_results
+  output:
+  tuple val(meta),
+        path("nxf_emit/*.final.split.vcf"),
+        path("nxf_emit/*.haplocheck_contamination.txt"),
+        path("nxf_emit/*.per_base_coverage.tsv"),
+        emit: wdl_files
+  path("nxf_emit/*"), optional: true, emit: wdl_dump
 
-    // 'wdl_files' captures the specific files needed for the next annotation step
-    output:
-    tuple val(meta),
-      path("final_wdl_output/**/execution/${meta.id}.merged.final.split.vcf"),
-      path("final_wdl_output/**/execution/${meta.id}.merged.haplocheck_contamination.txt"),
-      path("final_wdl_output/**/execution/${meta.id}.merged.per_base_coverage.tsv"),
-      emit: wdl_files
+  script: 
+"""
+  #!/usr/bin/env bash
+  set -euo pipefail
 
-    script:
-    """
-    #!/bin/bash
-    set -e
+  TARGET_DIR="${params.outdir}/${meta.id}/variant_calling"
+  mkdir -p "\${TARGET_DIR}"
 
-    # 1. Define the final output directory
-    FINAL_OUTPUT_DIR="final_wdl_output"
-    mkdir -p \${FINAL_OUTPUT_DIR} # Ensure directory exists
-    
-    # 2. Create Cromwell Options JSON to copy final outputs to FINAL_OUTPUT_DIR
-    cat > cromwell_options.json <<EOF
-    {
-      "final_workflow_outputs_dir": "\${FINAL_OUTPUT_DIR}",
-      "final_workflow_log_dir": ".",
-      "default_runtime_attributes": {
+  cat > cromwell_options.json <<EOF
+  {
+    "final_workflow_outputs_dir": "\${TARGET_DIR}",
+    "default_runtime_attributes": {
         "queue": "${params.cromwell_options.queue ?: ''}",
         "cpus": ${params.cromwell_options.cpus},
         "memory": ${params.cromwell_options.memory},
         "runtime_minutes": ${params.cromwell_options.runtime_minutes}
       }
-    }
-    EOF
+  }
+EOF
 
-    # 3. Run Cromwell
-    java -Dconfig.file=${cromwell_config} \\
-         -jar ${params.cromwell_jar} run \\
-         ${params.wdl_script} \\
-         --inputs ${wdl_inputs_json} \\
-         --options cromwell_options.json
-    
-    # 4. Verify that Cromwell succeeded and files exist in the output directory
-    if [ ! -d "\${FINAL_OUTPUT_DIR}" ] || [ -z "\$(ls -A \${FINAL_OUTPUT_DIR})" ]; then
-        echo "ERROR: Cromwell finished but no files were found in the final output directory: \${FINAL_OUTPUT_DIR}" >&2
-        exit 1
-    fi
-    """
+  java -Dconfig.file=${cromwell_config} -jar ${params.cromwell_jar} run ${params.wdl_script} --inputs ${wdl_inputs_json} --options cromwell_options.json
+
+  # Flatten important outputs from deep cromwell dirs into TARGET_DIR
+  shopt -s nullglob
+  patterns=(
+    "*.final.split.vcf" "*.final.split.vcf.idx"
+    "*.final.vcf.gz" "*.final.vcf.gz.tbi"
+    "*.vcf.gz" "*.vcf.gz.tbi"
+    "*.vcf.gz.numt.vcf.gz" "*.vcf.gz.numt.vcf.gz.tbi"
+    "*.splitAndPassOnly.vcf" "*.splitAndPassOnly.vcf.idx"
+    "*.per_base_coverage.tsv"
+    "*.haplocheck_contamination.txt"
+    "*.realigned.bam" "*.realigned.bai" "*.realigned.bwa.stderr.log"
+    "*.metrics" "metrics.txt" "theoretical_sensitivity.txt"
+    "*.bai" "*.cram" "*.crai"
+  )
+
+  for pat in "\${patterns[@]}"; do
+    while IFS= read -r -d '' f; do
+      base="\${f##*/}"
+      if [[ ! -e "\${TARGET_DIR}/\${base}" ]] || ! cmp -s "\$f" "\${TARGET_DIR}/\${base}"; then
+        cp -fL "\$f" "\${TARGET_DIR}/\${base}"
+      fi
+    done < <(find -L "\${TARGET_DIR}" -mindepth 2 -type f -name "\$pat" -print0)
+  done
+
+  WORK_EXEC="\$PWD/cromwell-executions"
+  if [[ -d "\${WORK_EXEC}" ]]; then
+    for pat in "\${patterns[@]}"; do
+      while IFS= read -r -d '' f; do
+        base="\${f##*/}"
+        if [[ ! -e "\${TARGET_DIR}/\${base}" ]] || ! cmp -s "\$f" "\${TARGET_DIR}/\${base}"; then
+          cp -fL "\$f" "\${TARGET_DIR}/\${base}"
+        fi
+      done < <(find -L "\${WORK_EXEC}" -mindepth 2 -type f -name "\$pat" -print0)
+    done
+  fi
+
+  # Existence checks for three core artifacts
+  VCF=\$(ls -1 "\${TARGET_DIR}"/*.final.split.vcf 2>/dev/null | head -n1 || true)
+  CTM=\$(ls -1 "\${TARGET_DIR}"/*.haplocheck_contamination.txt 2>/dev/null | head -n1 || true)
+  COV=\$(ls -1 "\${TARGET_DIR}"/*.per_base_coverage.tsv 2>/dev/null | head -n1 || true)
+
+  if [[ -z "\${VCF}" || -z "\${CTM}" || -z "\${COV}" ]]; then
+    echo "[ERROR] Missing required WDL outputs for ${meta.id}:" >&2
+    echo "  VCF: \${VCF:-<none>}"  >&2
+    echo "  CTM: \${CTM:-<none>}"  >&2
+    echo "  COV: \${COV:-<none>}"  >&2
+    exit 1
+  fi
+
+  # Emit symlinks for Nextflow outputs
+  EMIT_DIR="nxf_emit"
+  rm -rf "\${EMIT_DIR}"; mkdir -p "\${EMIT_DIR}"
+  ln -s "\${VCF}" "\${EMIT_DIR}/\${VCF##*/}"
+  ln -s "\${CTM}" "\${EMIT_DIR}/\${CTM##*/}"
+  ln -s "\${COV}" "\${EMIT_DIR}/\${COV##*/}"
+
+  for pat in "\${patterns[@]}"; do
+    for f in "\${TARGET_DIR}"/\$pat; do
+      base="\${f##*/}"
+      [[ -e "\${EMIT_DIR}/\${base}" ]] || ln -s "\$f" "\${EMIT_DIR}/\${base}"
+    done
+  done
+"""
+}
+
+process CALCULATE_MTCN {
+  tag "Calculate_mtCN for ${meta.id}"
+  label 'mtCN_related'
+
+  publishDir "${params.outdir}/${meta.id}/mtCN", mode: 'copy'
+
+  input:
+  tuple val(meta), path(cram), path(crai), path(mt_coverage)
+  path ref_fasta
+  path hail_dir
+
+  output:
+  tuple val(meta), path("mtCN_summary.txt"), emit: mtcn_summary
+
+  script:
+  def intervals_arg = params.wgs_intervals ? "--intervals ${params.wgs_intervals}" : ""
+  """
+  #!/usr/bin/env bash
+  set -euo pipefail
+  mkdir -p mtcn_out
+
+  REF_ABS=\$(readlink -f ${ref_fasta})
+  CRAM_ABS=\$(readlink -f ${cram})
+  CRAI_ABS=\$(readlink -f ${crai})
+  MT_COV_ABS=\$(readlink -f ${mt_coverage})
+
+  python ${hail_dir}/calculate_mtcn.py \\
+      --cram "\${CRAM_ABS}" \\
+      --crai "\${CRAI_ABS}" \\
+      --ref_fasta "\${REF_ABS}" \\
+      --mt_coverage "\${MT_COV_ABS}" \\
+      --output mtcn_out \\
+      --picard ${params.picard} \\
+      ${intervals_arg} \\
+      --read_length 150 \\
+      --min_mt_cov ${params.min_mt_cov ?: 100} \\
+      --min_mtcn ${params.min_mtcn ?: 50} \\
+      --max_mtcn ${params.max_mtcn ?: 500} \\
+      --max_contam ${params.max_contam ?: 0.02}
+
+  mv mtcn_out/mtCN_summary.txt ./mtCN_summary.txt
+  echo "[OK] mtCN summary generated for ${meta.id}"
+  """
+}
+
+process SAMPLE_LEVEL_FILTER {
+  tag "Sample filter ${meta.id}"
+  label 'mtCN_related'
+
+  input:
+  tuple val(meta), path(mtcn_summary)
+
+  output:
+  tuple val(meta), path(".pass.ok"), optional: true, emit: pass_signal
+
+  script:
+  """
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  if [[ ! -s "${mtcn_summary}" ]]; then
+    echo "[ERROR] mtCN summary file not found for ${meta.id}" >&2
+    exit 1
+  fi
+
+  tmp="\$(mktemp)"
+  tr -d '\\r' < "${mtcn_summary}" > "\$tmp"
+
+  # Robust parser: case-insensitive, tolerant to tab/space, accepts true/pass/1/yes/y
+  pass_flag=\$(python - "\$tmp" <<'PY'
+import sys, re, io
+p = sys.argv[1]
+with io.open(p, 'r', encoding='utf-8', errors='ignore') as f:
+    lines = [ln.strip() for ln in f if ln.strip()]
+if not lines:
+    print("FAIL"); sys.exit(0)
+
+split = re.compile(r'\\s+|\\t')
+header = split.split(lines[0])
+col = -1
+for i, name in enumerate(header):
+    if re.fullmatch(r'(?i)pass(?:_|\\s)?filter', name) or name.lower() in ('pass_filter','pass'):
+        col = i; break
+
+if col < 0 and len(header)==1:
+    val = lines[1].strip().lower() if len(lines)>1 else ''
+    print("PASS" if val in {"true","pass","1","yes","y"} else "FAIL")
+    sys.exit(0)
+
+if col < 0 or len(lines)<2:
+    print("FAIL"); sys.exit(0)
+
+val = split.split(lines[1])[col].strip().lower()
+print("PASS" if val in {"true","pass","1","yes","y"} else "FAIL")
+PY
+)
+
+  if [[ "\${pass_flag}" == "PASS" ]]; then
+    echo "[INFO] ${meta.id} passes mtCN/contamination thresholds"
+    touch .pass.ok
+    rm -f "\$tmp" 2>/dev/null || true
+  else
+    echo "[FILTERED] ${meta.id} did not pass QC (mtCN_summary.txt):" >&2
+    cat "\$tmp" >&2
+    # Soft filter: exit 0 without emitting .pass.ok, so downstream is skipped
+    exit 0
+  fi
+  """
 }
 
 process ANNOTATE_INDIVIDUAL_VCF {
-    tag "Annotate VCF for ${meta.id}_rerun3"
-    publishDir "${params.outdir}/${meta.id}/hail_results/annotation_individual", mode: 'copy'
+  tag "Annotate VCF ${meta.id}"
+  label 'vep_related'
 
-    input:
-    tuple val(meta), path(vcf), path(contamination), path(coverage)
-    path(hail_dir) // This is the directory containing 'add_annotation_refine.py'
+  publishDir "${params.outdir}", mode:'copy', saveAs: { fn -> "${meta.id}/${fn}" }
 
-    output:
-    // Emit all results, plus a '.annotate_complete' file as a success flag
-    tuple val(meta), path("hail_results/annotation_individual/**"), path(".annotate_complete"), emit: annotated_results
+  input:
+  tuple val(meta), path(vcf), path(contamination), path(coverage)
+  path hail_dir
 
-    script:
-    // Create the config.json for the python script from 'params'
-    def config_json = new groovy.json.JsonBuilder(params.hail_pipeline_config).toPrettyString()
-    // Define the input directory name that the python script expects
-    def hail_input_dir_name = "wdl_outputs"
+  output:
+  tuple val(meta), path("annotation/**"), path(".annotate_complete"), emit: annotated_results
 
-    """
-    #!/bin/bash
-    set -euo pipefail
+  script:
+  def cfg = new JsonBuilder( params.hail_pipeline_config ).toPrettyString()
+  def in_dir = "wdl_outputs"
+  """
+  #!/usr/bin/env bash
+  set -euo pipefail
 
-    echo "--- [DEBUG] STARTING ANNOTATE_INDIVIDUAL_VCF for ${meta.id} ---"
-    echo "[DEBUG] VCF:          ${vcf}"
-    echo "[DEBUG] Contamination:${contamination}"
-    echo "[DEBUG] Coverage:     ${coverage}"
+  printf '%s' '${cfg}' > config.json
+  rm -rf annotation
+  mkdir -p ${in_dir}/vcfs ${in_dir}/contamination ${in_dir}/coverage
+  mkdir -p annotation/{vep_vcf,metadata,final_outputs}
+  mkdir -p ${params.outdir}/merged_results/wdl_output
 
-    # Prepare dirs
-    printf '%s' '${config_json}' > config.json
-    # Clean up any previous run and create the expected directory structure
-    rm -rf hail_results
-    mkdir -p ${hail_input_dir_name}/vcfs 
-    mkdir -p ${hail_input_dir_name}/contamination 
-    mkdir -p ${hail_input_dir_name}/coverage
-    mkdir -p hail_results/annotation_individual/vep_vcf
-    mkdir -p hail_results/annotation_individual/metadata
-    mkdir -p hail_results/annotation_individual/final_outputs
+  cp "${vcf}"           "${in_dir}/vcfs/${meta.id}.merged.final.split.vcf"
+  cp "${contamination}" "${in_dir}/contamination/${meta.id}.merged.haplocheck_contamination.txt"
+  cp "${coverage}"      "${in_dir}/coverage/${meta.id}.merged.per_base_coverage.tsv"
 
-    # Copy files into the expected directory structure with the expected names
-    cp "${vcf}"           "${hail_input_dir_name}/vcfs/${meta.id}.merged.final.split.vcf"
-    cp "${contamination}" "${hail_input_dir_name}/contamination/${meta.id}.merged.haplocheck_contamination.txt"
-    cp "${coverage}"      "${hail_input_dir_name}/coverage/${meta.id}.merged.per_base_coverage.tsv"
+  cp "${vcf}"           "${params.outdir}/merged_results/wdl_output/${meta.id}.merged.final.split.vcf"
+  cp "${contamination}" "${params.outdir}/merged_results/wdl_output/${meta.id}.merged.haplocheck_contamination.txt"
+  cp "${coverage}"      "${params.outdir}/merged_results/wdl_output/${meta.id}.merged.per_base_coverage.tsv"
 
-    echo "--- Launching annotation for sample ${meta.id} ---"
-    # Launch the main python annotation script
-    python ${hail_dir}/add_annotation_refine.py --config config.json
+  python ${hail_dir}/add_annotation_single.py --config config.json
 
-    # Define the expected final output file for validation
-    FINAL_OUTPUT_FILE="hail_results/annotation_individual/final_outputs/POC_variant_list.txt"
+  FINAL_OUTPUT_FILE="annotation/final_outputs/variant_list.txt" 
+  if [[ -s "\${FINAL_OUTPUT_FILE}" ]]; then
+    echo "[SUCCESS] Annotation OK for ${meta.id} -> \${FINAL_OUTPUT_FILE}"
+    touch .annotate_complete
+  else
+    echo "ERROR: Expected final output '\${FINAL_OUTPUT_FILE}' not found or empty." >&2
+    ls -R annotation >&2 || true
+    exit 1
+  fi
+  """
+}
 
-    # Check if the final file exists (-f) and is not empty (-s)
-    if [ -f "\${FINAL_OUTPUT_FILE}" ] && [ -s "\${FINAL_OUTPUT_FILE}" ]; then
-        echo "[SUCCESS] Annotation OK for ${meta.id}. Final output '\${FINAL_OUTPUT_FILE}' found."
-        # If the file is valid, touch the success flag
-        touch .annotate_complete
-    else
-        # If file is missing or empty, print error and exit with an error code
-        echo "ERROR: Expected FINAL output file '\${FINAL_OUTPUT_FILE}' not found or empty." >&2
-        echo "This likely means the python script failed silently." >&2
-        echo "--- Debug: listing hail_results tree ---" >&2
-        ls -R hail_results >&2
-        # This ensures Nextflow reports the task as failed
-        exit 1
-    fi
-    """
+// ======================================================================
+// WORKFLOW
+// ======================================================================
+workflow {
+
+  // ---------------- FASTQ path ----------------
+  ch_fastq_pairs = ch_fastqs.flatMap { meta, type, pairs ->
+    pairs.indexed().collect { i, p -> [ meta + [pair_id: i], p[0], p[1] ] }
+  }
+
+  ALIGN_AND_UNSORT(ch_fastq_pairs, ch_ref_fasta_val)
+  SORT_AND_CONVERT_TO_CRAM(ALIGN_AND_UNSORT.out.unsorted_bam, ch_ref_fasta_val)
+
+  ch_crams_from_fastq =
+    SORT_AND_CONVERT_TO_CRAM.out.single_cram
+      .map { meta, cram, crai -> tuple(meta.id, tuple(meta, cram, crai)) }
+      .groupTuple()
+      .map { sid, tuples ->
+        def meta  = tuples.first()[0]
+        def crams = tuples.collect { it[1] }
+        def crais = tuples.collect { it[2] }
+        tuple(meta, crams, crais)
+      }
+
+  ch_fastq_split = ch_crams_from_fastq.branch {
+    merge : it[1].size() > 1
+    single: it[1].size() <= 1
+  }
+  ch_merge_inputs_fastq = ch_fastq_split.merge
+  ch_single_fastq = ch_fastq_split.single.map { rec ->
+    def meta  = rec[0]; def crams = rec[1]; def crais = rec[2]
+    tuple(meta, crams[0], crais[0])
+  }
+
+  // ---------------- BAM path ----------------
+  ch_bam_crams = ch_bams.flatMap { meta, type, pairs ->
+    pairs.indexed().collect { i, p -> [meta + [pair_id: i], p[0]] }
+  }
+  CONVERT_BAM_TO_CRAM(ch_bam_crams, ch_ref_fasta_val)
+
+  ch_final_from_bam = CONVERT_BAM_TO_CRAM.out.merged_cram
+    .map { meta, cram, crai -> tuple(meta.id, tuple(meta, cram, crai)) }
+    .groupTuple()
+    .map { sid, tuples ->
+      def meta  = tuples.first()[0]
+      def crams = tuples.collect { it[1] }
+      def crais = tuples.collect { it[2] }
+      tuple(meta, crams, crais)
+    }
+    .branch {
+      merge : it[1].size() > 1
+      single: it[1].size() <= 1
+    }
+
+  ch_merge_inputs_bam = ch_final_from_bam.merge
+  ch_single_bam = ch_final_from_bam.single.map { rec ->
+    def meta  = rec[0]; def crams = rec[1]; def crais = rec[2]
+    tuple(meta, crams[0], crais[0])
+  }
+
+  // ---------------- CRAM path ----------------
+  ch_final_from_cram = ch_crams
+    .map { meta, type, pairs -> [ meta, pairs.collect { it[0] }, pairs.collect { it[1] } ] }
+    .branch {
+      merge : it[1].size() > 1
+      single: it[1].size() <= 1
+    }
+
+  ch_merge_inputs_cram = ch_final_from_cram.merge
+  ch_single_cram = ch_final_from_cram.single.map { rec ->
+    def meta  = rec[0]; def crams = rec[1]; def crais = rec[2]
+    tuple(meta, crams[0], crais[0])
+  }
+
+  // Merge-only branch across sources (FASTQ/BAM/CRAM)
+  ch_all_merge_inputs = ch_merge_inputs_fastq.mix(ch_merge_inputs_bam).mix(ch_merge_inputs_cram)
+  MERGE_CRAMS(ch_all_merge_inputs)
+  ch_merged_results = MERGE_CRAMS.out.merged_cram  // (meta, merged.cram, merged.crai)
+
+  // Single-file (no merge needed) branch
+  ch_all_singles = ch_single_fastq.mix(ch_single_bam).mix(ch_single_cram)
+
+  // Unified (meta, cram, crai) for downstream
+  ch_all_crams = ch_merged_results.mix(ch_all_singles)
+
+  // ---------------- downstream ----------------
+  GENERATE_CRAM_TSV(ch_all_crams)
+  GENERATE_WDL_JSON(GENERATE_CRAM_TSV.out.tsv)
+  RUN_WDL_VARIANT_CALLING(GENERATE_WDL_JSON.out.json, ch_cromwell_conf)
+
+  // Key join by sample id to avoid meta mismatch; ensure path() types
+  ch_all_crams_keyed = ch_all_crams.map { meta, cram, crai -> tuple(meta.id as String, [meta, file(cram), file(crai)]) }
+  ch_wdl_keyed       = RUN_WDL_VARIANT_CALLING.out.wdl_files.map { meta, vcf, contam, coverage ->
+                        tuple(meta.id as String, [meta, file(vcf), file(contam), file(coverage)]) }
+
+  ch_joined = ch_all_crams_keyed.join(ch_wdl_keyed).map { sid, left, right ->
+    def meta = left[0]
+    def cram = left[1]
+    def crai = left[2]
+    def vcf  = right[1]
+    def contamination = right[2]
+    def coverage = right[3]
+    tuple(meta, cram, crai, coverage, contamination)
+  }
+
+  // Filter missing paths
+  ch_mtcn_inputs = ch_joined
+    .filter { meta, cram, crai, coverage, contamination -> cram && crai && coverage }
+    .map    { meta, cram, crai, coverage, contamination -> tuple(meta, file(cram), file(crai), file(coverage)) }
+
+  CALCULATE_MTCN(ch_mtcn_inputs, ch_ref_fasta_val, ch_hail_directory)
+
+  // Gate annotation by PASSed samples
+  SAMPLE_LEVEL_FILTER(CALCULATE_MTCN.out.mtcn_summary)
+
+  ch_pass_keyed = SAMPLE_LEVEL_FILTER.out.pass_signal.map { meta, _ -> tuple(meta.id as String, [meta]) }
+  ch_wdl_keyed2 = RUN_WDL_VARIANT_CALLING.out.wdl_files.map { meta, vcf, contam, coverage ->
+                    tuple(meta.id as String, [meta, file(vcf), file(contam), file(coverage)]) }
+
+  ch_annotate_inputs = ch_pass_keyed.join(ch_wdl_keyed2).map { sid, left, right ->
+    def meta = left[0]
+    def vcf = right[1]
+    def contamination = right[2]
+    def coverage = right[3]
+    tuple(meta, vcf, contamination, coverage)
+  }
+
+  ANNOTATE_INDIVIDUAL_VCF(ch_annotate_inputs, ch_hail_directory)
+}
+
+// ======================================================================
+// WORKFLOW HOOKS
+// ======================================================================
+workflow.onComplete {
+  if( workflow.success ) {
+    log.info """Pipeline completed successfully.
+Output files are in: ${params.outdir}"""
+  } else {
+    // Intentionally silent on failure (avoid printing a success banner).
+  }
+}
+
+workflow.onError { e ->
+  log.error """
+----------------------------------------------------
+ERROR: Pipeline execution failed!
+Message: ${e?.message}
+----------------------------------------------------
+"""
 }

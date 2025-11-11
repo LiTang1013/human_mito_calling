@@ -1,216 +1,230 @@
 #!/bin/bash
-#SBATCH --job-name=Mito_Pipeline_Manager # Job name in the queue
-#SBATCH --cpus-per-task=2               # Request 2 CPU cores
-#SBATCH --mem=8G                          # Request 8 GB of memory
-#SBATCH --time=24:00:00                   # Max runtime of 24 hours
-#SBATCH --output=mito_pipeline_manager_%j.log # Log file name (%j = job ID)
+#SBATCH --job-name=Mito_Pipeline_Manager         # Job name in the queue
+#SBATCH --cpus-per-task=2                        # Request 2 CPU cores
+#SBATCH --mem=8G                                 # Request 8 GB of memory
+#SBATCH --time=24:00:00                          # Max runtime of 24 hours
+#SBATCH --output=log/mito_pipeline_manager_%j.log # Log file name (%j = job ID)
 
 # Exit immediately if any command fails
 set -e
 
 # ==============================================================================
-# --- User Configuration Area (Please modify for your environment) ---
+#                         User Configuration (edit below)
 # ==============================================================================
 
-# 1. File and Directory Paths
-MAIN_NF_SCRIPT="/home/lt692/project_pi_njl27/lt692/human_mito_calling-main/main.nf"       # Path to the main Nextflow script
-NEXTFLOW_CONFIG="/home/lt692/project_pi_njl27/lt692/human_mito_calling-main/nextflow.config" # Path to the Nextflow config file
-MASTER_SAMPLE_LIST="/home/lt692/scratch_pi_njl27/lt692/human_mt_variant_calling/test_sample.tsv" # TSV file containing all samples and URLs
-HAIL_SCRIPT_DIR="/home/lt692/project_pi_njl27/lt692/human_mito_calling-main/hail"                 # Directory containing all hail/.py scripts
-OUTPUT_DIR="/home/lt692/scratch_pi_njl27/lt692/human_mt_variant_calling/results"    # Final results output directory (used as a fallback)
+# 1) File and Directory Paths
+SCRIPT_BASE_DIR="/path/to/human_mito_calling-main"   # Pipeline root
+MAIN_NF_SCRIPT="$SCRIPT_BASE_DIR/main.nf"                                      # Main Nextflow script
+NEXTFLOW_CONFIG="$SCRIPT_BASE_DIR/nextflow_Bouchet.config"                     # Nextflow config
 
-# --- CRITICAL: Define a file to store the shared, unique sample list ---
-# This file is written by the Master (Stage 1) and read by the Workers (Stage 1)
-UNIQUE_SAMPLE_FILE="unique_samples_for_job_array.list"
+MASTER_SAMPLE_LIST="/path/to/test_sample_cram.tsv"  # TSV with all samples/URLs
+OUTPUT_DIR="/path/to/output_dir"             # Final output dir (fallback)
+WORK_DIR_BASE="/path/to/work_dir"                   # Base work dir for intermediates
 
-# 2. Slurm Job Array Configuration
-CONCURRENT_SAMPLES=3 # Max number of samples (array tasks) to run simultaneously
+# 2) Slurm Job Array Concurrency
+CONCURRENT_SAMPLES=3  # Max number of array tasks to run simultaneously
+
+# 3) Pipeline Mode: "population" or "disease"
+PIPELINE_MODE="disease"
+
+# Required only if PIPELINE_MODE="disease"; ignored for "population"
+DISEASE_META_FILE="/path/to/disease_meta.tsv"
+
+# 4) Environment for Nextflow (please change this per your server)
+module load Nextflow/24.10.2
 
 # ==============================================================================
-# -----------------        Script main logic       --------------------------
-# This script operates in 3 modes:
-# 1. Master Mode (Default): Run on login node. Creates the unique sample list and
-#                          submits Stage 1 (array) and Stage 2 (finalize) jobs.
-# 2. Worker Mode (if $SLURM_ARRAY_TASK_ID is set): Runs on compute nodes as an
-#                          array task. Processes one unique sample.
-# 3. Finalizer Mode (if $1 == --finalize): Runs on a compute node after all
-#                          workers are done. Merges all results using Hail.
+#                                  Script Modes
+# ------------------------------------------------------------------------------
+# 1) Master Mode (default, no args, login node):
+#       - Build unique sample list
+#       - Submit Stage 1 (array workers) and Stage 2 (finalizer) jobs
+# 2) Worker Mode (compute node; when $SLURM_ARRAY_TASK_ID is set):
+#       - Process one unique sample (one array task)
+# 3) Finalizer Mode (compute node; when $1 == --finalize):
+#       - Merge/annotate final outputs across samples (Hail/Nextflow)
 # ==============================================================================
 
-# --- Mode 3: Finalizer Mode (Merging) ---
-# This block executes if the script is called with the '--finalize' argument
-# It will only be run by Slurm after the STAGE 1 job array (all workers) succeeds.
+# Internal file (do not change)
+INTERNAL_SAMPLE_LIST="unique_samples_for_job_array.list"
+
+# ==============================================================================
+#                            Mode 3: Finalizer Mode
+# ==============================================================================
 if [ "$1" == "--finalize" ]; then
     echo "========================================================"
-    echo "--- STAGE 2: FINALIZER MODE - Merging all sample outputs"
+    echo "--- STAGE 2: FINALIZER MODE - Starting Nextflow Finalizer"
     echo "========================================================"
 
-    # Add the Hail script directory to the Python path
-    # This ensures the 'import' statements in the .py scripts work
-    export PYTHONPATH="${HAIL_SCRIPT_DIR}:${PYTHONPATH}"
-    echo "[*] Added ${HAIL_SCRIPT_DIR} to PYTHONPATH."
+    MERGED_INPUT_DIR="${OUTPUT_DIR}/merged_results/wdl_output"
 
-    # Attempt to automatically find the Nextflow 'outdir' from the config file
-    RESULTS_DIR=$(grep -oP "outdir\s*=\s*'\K[^']+" "$NEXTFLOW_CONFIG")
-    if [ -z "$RESULTS_DIR" ]; then
-        # Fallback to the user-defined OUTPUT_DIR if not found in the config
-        echo "[!] WARN: Could not determine 'outdir' from nextflow.config. Using user-defined OUTPUT_DIR."
-        RESULTS_DIR="$OUTPUT_DIR"
+    if [ ! -d "$MERGED_INPUT_DIR" ]; then
+        echo "[SKIP] 'merged_results' directory not found: $MERGED_INPUT_DIR"
+        echo "[SKIP] No passing samples; skipping Stage 2."
+        exit 0
     fi
-    echo "[*] Using results directory: $RESULTS_DIR"
 
-    # --- Hail Step 1: Create coverage matrix ---
-    echo "[*] Step 2.1: Creating Hail matrix table for coverage..."
-    # Find all coverage files from Stage 1 and save their paths to a list
-    find "$RESULTS_DIR" -name "*.per_base_coverage.tsv" > coverage_files.list
-    # Run the Hail script to merge all files into a single MatrixTable (MT)
-    python "${HAIL_SCRIPT_DIR}/annotate_coverage.py" --input-list coverage_files.list --output-mt coverage.mt
-    echo "[+] Coverage matrix table created at coverage.mt"
+    has_files=$(find "$MERGED_INPUT_DIR" -maxdepth 1 -type f \
+        \( -name "*.merged.final.split.vcf" \
+           -o -name "*.merged.per_base_coverage.tsv" \
+           -o -name "*.merged.haplocheck_contamination.txt" \) -print -quit || true)
 
-    # --- Hail Step 2: Merge VCFs ---
-    echo "[*] Step 2.2: Merging and filtering single sample VCF files..."
-    # Find all final VCF files from Stage 1
-    find "$RESULTS_DIR" -name "*.final.vcf.gz" > vcf_files.list
-    # Run Hail script to combine VCFs, using the coverage.mt for filtering
-    python "${HAIL_SCRIPT_DIR}/combine_vcfs.py" --coverage-mt coverage.mt --input-list vcf_files.list --output-file-name combined_variants
-    echo "[+] Combined VCF and MatrixTable created."
+    if [ -z "$has_files" ]; then
+        echo "[SKIP] No final artifacts detected under: $MERGED_INPUT_DIR"
+        echo "[SKIP] Skipping Stage 2 (no annotation outputs to merge)."
+        exit 0
+    fi
 
-    # --- Hail Step 3: Final Annotation ---
-    echo "[*] Step 2.3: Adding additional annotations..."
-    python "${HAIL_SCRIPT_DIR}/add_annotations.py" --input-mt combined_variants.mt --output-mt final_annotated_results.mt
-    echo "[+] Final annotation complete."
+    PROJECT_ROOT=$(dirname "$MAIN_NF_SCRIPT")
+    FINALIZER_WORK_DIR="${WORK_DIR_BASE}/final"
+    MERGE_NF_SCRIPT="$PROJECT_ROOT/merge.nf"
 
-    echo "[SUCCESS] Stage 2 (Finalizer) finished successfully."
+    if [ ! -f "$MERGE_NF_SCRIPT" ]; then
+        echo "[ERROR] merge.nf not found at: $MERGE_NF_SCRIPT"
+        exit 1
+    fi
+
+    echo "[*] Launching Nextflow finalizer: $MERGE_NF_SCRIPT"
+    echo "[*] Input directory: $MERGED_INPUT_DIR"
+
+    # Extra args for disease mode
+    EXTRA_ARGS=()
+    if [ "${PIPELINE_MODE}" = "disease" ]; then
+        if [ -z "${DISEASE_META_FILE:-}" ] || [ ! -f "${DISEASE_META_FILE}" ]; then
+            echo "[ERROR] PIPELINE_MODE='disease' but DISEASE_META_FILE is missing or not a file."
+            echo "        Set DISEASE_META_FILE=/abs/path/to/disease_meta.tsv"
+            exit 1
+        fi
+        echo "[*] Disease mode: using meta file ${DISEASE_META_FILE}"
+        EXTRA_ARGS+=( --disease_meta_file "${DISEASE_META_FILE}" )
+    fi
+
+    nextflow run "$MERGE_NF_SCRIPT" \
+        -c "$NEXTFLOW_CONFIG" \
+        -profile cluster \
+        -resume \
+        --merged_dir "$MERGED_INPUT_DIR" \
+        --pipeline_mode "$PIPELINE_MODE" \
+        --outdir "$OUTPUT_DIR" \
+        "${EXTRA_ARGS[@]}" \
+        -w "$FINALIZER_WORK_DIR" \
+        -with-report   "$WORK_DIR/running_report_final.html"
+
+    NF_EXIT=$?
+    if [ $NF_EXIT -eq 0 ]; then
+        echo "[SUCCESS] Stage 2 (Nextflow finalizer) completed successfully."
+    else
+        echo "[ERROR] Stage 2 (Nextflow finalizer) failed with exit code $NF_EXIT."
+        exit $NF_EXIT
+    fi
     exit 0
 
-# --- Mode 2: Worker Mode (Compute Node) ---
-# This block executes if the script is running as part of a Slurm Job Array
-# (i.e., $SLURM_ARRAY_TASK_ID is set by Slurm)
+# ==============================================================================
+#                            Mode 2: Worker Mode
+# ==============================================================================
 elif [ -n "$SLURM_ARRAY_TASK_ID" ]; then
     echo "================================================================="
     echo "--- STAGE 1: WORKER MODE on Compute Node (Task ${SLURM_ARRAY_TASK_ID}) ---"
     echo "================================================================="
-    
-    # Critical check: Ensure the sample list file created by the Master exists
-    if [ ! -f "$UNIQUE_SAMPLE_FILE" ]; then
-        echo "[!] ERROR: Cannot find the unique sample list file: $UNIQUE_SAMPLE_FILE"
-        echo "[!] This file should have been created by the Master Mode."
+
+    if [ ! -f "$INTERNAL_SAMPLE_LIST" ]; then
+        echo "[ERROR] Unique sample list not found: $INTERNAL_SAMPLE_LIST"
+        echo "[ERROR] This file should be created by Master Mode."
         exit 1
     fi
 
-    # --- Key logic: Get the unique SAMPLE_ID for this specific array task ---
-    # Slurm array tasks are 0-indexed, but file lines are 1-indexed
+    # Map array index to the corresponding SAMPLE_ID (line = index + 1)
     TASK_INDEX=$((SLURM_ARRAY_TASK_ID + 1))
-    # Get the sample ID by reading the Nth line (where N=TASK_INDEX) from the unique list
-    SAMPLE_ID=$(awk -v line=$TASK_INDEX 'NR==line {print; exit}' "$UNIQUE_SAMPLE_FILE" | tr -d '\r') # tr removes potential carriage returns
+    SAMPLE_ID=$(awk -v line=$TASK_INDEX 'NR==line {print; exit}' "$INTERNAL_SAMPLE_LIST" | tr -d '\r')
 
     if [ -z "$SAMPLE_ID" ]; then
-        echo "[!] No valid SAMPLE_ID found in $UNIQUE_SAMPLE_FILE for task ${SLURM_ARRAY_TASK_ID} (Line $TASK_INDEX)"
+        echo "[ERROR] No SAMPLE_ID found in $INTERNAL_SAMPLE_LIST for task ${SLURM_ARRAY_TASK_ID} (line $TASK_INDEX)"
         exit 1
     fi
     echo "[*] Processing unique sample: ${SAMPLE_ID}"
 
-    # 1. Define and enter a unique 'launch directory' for this task
-    #    This prevents conflicts with .nextflow.log and .nextflow/ directories
-    RUN_DIR="batch_${SLURM_ARRAY_TASK_ID}"
-    mkdir -p "${RUN_DIR}"
-    cd "${RUN_DIR}"
-    echo "[*] Changed to unique launch directory: $(pwd)"
-
-    # 2. Define a unique 'work directory' for Nextflow's -w flag
-    #    This is where Nextflow will store all intermediate (work) files
-    WORK_DIR="/home/lt692/scratch_pi_njl27/lt692/human_mt_variant_calling/nextflow_work/${RUN_DIR}"
+    WORK_DIR="${WORK_DIR_BASE}/batch_${SLURM_ARRAY_TASK_ID}"
     mkdir -p "$WORK_DIR"
-    echo "[*] Using stable run/work directory: ${WORK_DIR}"
+    cd "$WORK_DIR"
+    echo "[*] Working directory: $(pwd)"
 
-    # 3. Create a unique 'sample input file' for this task
-    #    This file will be passed to Nextflow via --input
+    # Build per-task input TSV containing all rows for this SAMPLE_ID
     TEMP_TSV="${WORK_DIR}/sample_${SAMPLE_ID}.tsv"
-    
-    # This grep is important: it finds *all* lines in the MASTER list that
-    # match this *unique* sample ID. This correctly handles cases where
-    # one sample has multiple input files (e.g., multiple lanes).
-    grep "^${SAMPLE_ID}\s" "$MASTER_SAMPLE_LIST" > "$TEMP_TSV"
-    
-    echo "[*] Created/Updated stable input file: ${TEMP_TSV}"
-    echo "[*] Input file contents:"
+    awk -v id="$SAMPLE_ID" '$1==id {print}' "$MASTER_SAMPLE_LIST" > "$TEMP_TSV"
+
+    echo "[*] Generated input file: ${TEMP_TSV}"
+    echo "[*] Contents:"
     cat "${TEMP_TSV}"
 
-    # 4. Load required software modules
-    module load Nextflow/24.10.2
-    module load miniconda/24.11.3
-    module load VEP/113.3-GCC-13.3.0
+    # Assemble Nextflow CLI arguments
+    NEXTFLOW_RUN_ARGS=()
+    NEXTFLOW_RUN_ARGS+=("-c" "$NEXTFLOW_CONFIG")
+    NEXTFLOW_RUN_ARGS+=("-profile" "cluster")
+    NEXTFLOW_RUN_ARGS+=("-resume")
+    NEXTFLOW_RUN_ARGS+=("-w" "$WORK_DIR")
+    NEXTFLOW_RUN_ARGS+=("--input" "$TEMP_TSV")
+    NEXTFLOW_RUN_ARGS+=("--outdir" "$OUTPUT_DIR")
+    NEXTFLOW_RUN_ARGS+=("-with-report" "$WORK_DIR/running_report_main.html")
 
-    # 5. Run the Nextflow pipeline
-    nextflow run "$MAIN_NF_SCRIPT" \
-        -c "$NEXTFLOW_CONFIG" \
-        -profile cluster \
-        -resume \
-        -w ${WORK_DIR} \
-        --input "$TEMP_TSV" 
-
-    # Capture Nextflow's exit code
-    NF_EXIT=$?
-
-    if [ $NF_EXIT -eq 0 ]; then
-        echo "Batch ${SLURM_ARRAY_TASK_ID} completed successfully for sample ${SAMPLE_ID}."
-        echo "Cleaning up Nextflow work directory: ${WORK_DIR}"
-        # Cleanup is commented out. Uncomment if you want to save space.
-        #rm -rf "${WORK_DIR}"
+    if [ "$PIPELINE_MODE" == "disease" ]; then
+        echo "[*] Mode: disease (will check disease meta file)"
+        if [ -z "$DISEASE_META_FILE" ] || [ ! -f "$DISEASE_META_FILE" ]; then
+            echo "[ERROR] PIPELINE_MODE='disease' but DISEASE_META_FILE not set or missing."
+            echo "[ERROR] Looked for: $DISEASE_META_FILE"
+            exit 1
+        fi
+        NEXTFLOW_RUN_ARGS+=("--disease_meta_file" "$DISEASE_META_FILE")
+    elif [ "$PIPELINE_MODE" == "population" ]; then
+        echo "[*] Mode: population (disease meta not used)"
     else
-        echo "Batch ${SLURM_ARRAY_TASK_ID} failed (exit code $NF_EXIT) for sample ${SAMPLE_ID}."
-        # If it failed, retain the work directory for debugging
-        echo "Retaining work directory for next run/debugging: ${WORK_DIR}"
-    fi
-
-    echo "--- Finished Job Array Task ${SLURM_ARRAY_TASK_ID} ---"
-
-# --- Mode 1: Master Mode (Login Node) ---
-# This is the default block that executes when you first run the script
-# Its only job is to prepare and submit the other jobs to Slurm.
-else
-    echo "========================================================"
-    echo "--- STAGE 1: MASTER MODE on Login Node - Submitting jobs"
-    echo "========================================================"
-    
-    # --- Key logic: Create the job array based on *unique* sample IDs ---
-
-    echo "[*] Creating unique sample list from $MASTER_SAMPLE_LIST..."
-    # 1. Get the first column (sample ID) from the master TSV.
-    # 2. Remove the header row (case-insensitive).
-    # 3. Sort and keep only unique sample IDs.
-    # 4. Save this list to the shared file for the workers.
-    cut -f1 "$MASTER_SAMPLE_LIST" | grep -v -i "^sample" | sort -u > "$UNIQUE_SAMPLE_FILE"
-
-    # Count how many unique samples there are
-    NUM_SAMPLES=$(wc -l < "$UNIQUE_SAMPLE_FILE")
-    
-    if [ "$NUM_SAMPLES" -eq 0 ]; then
-        echo "[!] ERROR: Master sample list contains no valid sample IDs (after excluding header)."
+        echo "[ERROR] Invalid PIPELINE_MODE: '$PIPELINE_MODE' (must be 'population' or 'disease')"
         exit 1
     fi
-    
-    # Slurm array indices are 0-based
-    ARRAY_INDEX=$((NUM_SAMPLES - 1)) 
-    
-    echo "[*] Found ${NUM_SAMPLES} unique samples (saved to $UNIQUE_SAMPLE_FILE)."
-    echo "[*] Submitting job array (0-${ARRAY_INDEX}) to run ${CONCURRENT_SAMPLES} samples concurrently..."
 
-    # Submit Stage 1 (the Worker jobs) as a job array
-    # --parsable: Makes sbatch output *only* the job ID
-    # --array=...%...: Runs tasks 0 to ARRAY_INDEX, with CONCURRENT_SAMPLES running at a time
-    # "$0": The script to run is *this script itself* (which will trigger Mode 2)
-    STAGE1_JOB_ID=$(sbatch --parsable --array=0-${ARRAY_INDEX}%${CONCURRENT_SAMPLES} "$0")
-    echo "[*] Stage 1 (Nextflow runs) submitted to Slurm with Job Array ID: ${STAGE1_JOB_ID}"
+    echo "[*] Starting Nextflow..."
+    nextflow run "$MAIN_NF_SCRIPT" "${NEXTFLOW_RUN_ARGS[@]}"
 
-    # Submit Stage 2 (the Finalizer job)
-    # --dependency=afterok:...: CRITICAL! This job will only start *after*
-    #                           the *entire* STAGE1_JOB_ID array completes successfully.
-    # "$0" --finalize: Call *this script itself* again, but pass the '--finalize'
-    #                  flag to trigger Mode 3.
-    STAGE2_JOB_ID=$(sbatch --parsable --dependency=afterok:${STAGE1_JOB_ID} "$0" --finalize)
-    echo "[*] Stage 2 (Hail merge) submitted to Slurm with Job ID: ${STAGE2_JOB_ID}"
-    echo "[*] This job will start only after the entire job array ${STAGE1_JOB_ID} completes successfully."
+    NF_EXIT=$?
+    if [ $NF_EXIT -eq 0 ]; then
+        echo "Batch ${SLURM_ARRAY_TASK_ID} completed successfully for sample ${SAMPLE_ID}."
+    else
+        echo "Batch ${SLURM_ARRAY_TASK_ID} failed (exit code $NF_EXIT) for sample ${SAMPLE_ID}."
+        echo "Retaining work directory for debugging: ${WORK_DIR}"
+    fi
+    echo "--- Finished Job Array Task ${SLURM_ARRAY_TASK_ID} ---"
 
-    echo "[SUCCESS] All jobs submitted. Monitor with 'squeue -u \$USER'."
+# ==============================================================================
+#                            Mode 1: Master Mode
+# ==============================================================================
+else
+    echo "========================================================"
+    echo "--- STAGE 0: MASTER MODE on Login Node - Submitting jobs"
+    echo "========================================================"
+
+    LOG_DIR="log"
+    mkdir -p "$LOG_DIR"
+    echo "[*] Log directory: $(pwd)/${LOG_DIR}"
+
+    echo "[*] Building unique sample list from: $MASTER_SAMPLE_LIST"
+    cut -f1 "$MASTER_SAMPLE_LIST" | grep -vi "^sample" | sort -u > "$INTERNAL_SAMPLE_LIST"
+
+    NUM_SAMPLES=$(wc -l < "$INTERNAL_SAMPLE_LIST")
+    if [ "$NUM_SAMPLES" -eq 0 ]; then
+        echo "[ERROR] No valid sample IDs (after excluding header)."
+        exit 1
+    fi
+
+    ARRAY_INDEX=$((NUM_SAMPLES - 1))
+    echo "[*] Found ${NUM_SAMPLES} unique samples (saved to $INTERNAL_SAMPLE_LIST)."
+    echo "[*] Submitting job array (0-${ARRAY_INDEX}) with concurrency ${CONCURRENT_SAMPLES}..."
+
+    STAGE1_JOB_ID=$(sbatch --parsable --array=0-${ARRAY_INDEX}%${CONCURRENT_SAMPLES} \
+        --output="${LOG_DIR}/mito_pipeline_worker_%A_%a.log" "$0")
+    echo "[*] Stage 1 submitted (Job Array ID: ${STAGE1_JOB_ID})"
+
+    STAGE2_JOB_ID=$(sbatch --parsable --dependency=afterok:${STAGE1_JOB_ID} \
+        --output="${LOG_DIR}/mito_pipeline_finalizer_%A.log" "$0" --finalize)
+    echo "[*] Stage 2 submitted (Job ID: ${STAGE2_JOB_ID}); will start after array ${STAGE1_JOB_ID} completes successfully."
+
+    echo "[SUCCESS] All jobs submitted. Monitor with 'squeue -u $USER' or check the '${LOG_DIR}' directory."
 fi
