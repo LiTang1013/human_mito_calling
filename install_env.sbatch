@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 #SBATCH -J env_setup
 #SBATCH -o env_setup_%j.out
 #SBATCH -e env_setup_%j.err
@@ -6,17 +7,23 @@
 #SBATCH --mem=16G
 #SBATCH -t 02:00:00
 
-# 严格模式，但在激活 conda 前后会临时关闭 -u
-set -euo pipefail
+# Exit immediately if a command exits with a non-zero status.
+# Treat unset variables as an error.
+set -eo pipefail
 
 echo "========== Job Started =========="
 date
 
-# --------- 定位 Conda base ----------
-# 优先使用你提供的路径；若没改或无效，自动 fallback 到 `conda info --base`
-CONDA_BASE="/apps/software/2022b/software/miniconda/24.11.3"  # 如需更改，改这里
+# ---------------- Locate Conda Base ----------------
+# Temporarily disable 'nounset' (-u) before and after sourcing conda.sh
+# to prevent issues with unbound variables within the environment setup scripts.
+
+# Prioritize the user-provided path; fallback to 'conda info --base'
+CONDA_BASE="/path/to/conda_base" # Change this path if needed.
+
 if [[ ! -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]]; then
   if command -v conda >/dev/null 2>&1; then
+    # Use 'conda info --base' only if 'conda' command is found
     CONDA_BASE="$(conda info --base 2>/dev/null || true)"
   fi
 fi
@@ -26,14 +33,14 @@ if [[ -z "${CONDA_BASE}" || ! -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]]; then
   exit 1
 fi
 
-# 规避 activate.d 与 set -u 冲突
+# Source Conda initialization script
 set +u
 source "${CONDA_BASE}/etc/profile.d/conda.sh"
 set -u
 
-# 确保 base 里有 mamba
+# ---------------- Ensure Mamba is installed in base ----------------
 if ! command -v mamba >/dev/null 2>&1; then
-  echo "[INFO] Installing mamba into base..."
+  echo "[INFO] Installing mamba into base environment..."
   set +u
   conda activate base
   set -u
@@ -43,13 +50,14 @@ fi
 
 ENV_NAME="bio_pipeline_env"
 
-# 若环境不存在则创建（存在则跳过创建）
+# ---------------- Create or Update Environment ----------------
+# Check if environment already exists
 if ! conda env list | awk '{print $1}' | grep -qx "${ENV_NAME}"; then
-  echo "[INFO] Creating env '${ENV_NAME}' ..."
-  # 说明：
-  # - openjdk=17 供 GATK/Picard/Hail
+  echo "[INFO] Creating environment '${ENV_NAME}'..."
+  # Package list:
+  # - openjdk=17 for GATK/Picard/Hail
   # - ensembl-vep=113.0
-  # - perl-list-moreutils=0.430.* 解决 VEP Perl 依赖
+  # - Perl libs (perl-list-moreutils, perl-json, etc.) for VEP dependencies
   mamba create -y -n "${ENV_NAME}" -c bioconda -c conda-forge \
     "python=3.11" \
     "openjdk=17" \
@@ -65,58 +73,61 @@ if ! conda env list | awk '{print $1}' | grep -qx "${ENV_NAME}"; then
     "perl-dbi" \
     "perl-dbd-mysql" \
     "ensembl-vep=113.0"
+else
+  echo "[INFO] Environment '${ENV_NAME}' already exists. Skipping creation."
 fi
 
-# 激活环境（同样临时关闭 -u 以防 activate.d 报 unbound variable）
+# Activate the environment
 set +u
 conda activate "${ENV_NAME}"
 set -u
 
-# --------- Python libs ----------
+# ---------------- Install Python Libraries ----------------
 python -m pip install --upgrade pip
-# 让 hail 自动拉匹配的 pyspark/py4j，避免手工指定引发的依赖冲突
+# Install Hail and matching dependencies. Letting Hail pull its own PySpark/py4j
+# minimizes manual dependency conflicts.
 python -m pip install \
   "hail==0.2.133" \
   "pandas>=2.2,<3" \
   "numpy>=1.26,<3"
 
-# --------- Sanity checks ----------
-python - <<'PY'
-try:
-    import hail as hl, pyspark, py4j
-    print("hail   =", hl.__version__)
-    print("pyspark=", pyspark.__version__)
-    print("py4j   =", py4j.__version__)
-except Exception as e:
-    print("[WARN] Python libs check failed:", e)
-PY
-
+# ---------------- Sanity Checks ----------------
 echo "---------- Sanity Checks ----------"
+
+# Java Checks
 which java || true
 java -version || true
 
+# GATK Check
 echo "gatk version:"
 gatk --version || true
 
-echo "picard help:"
+# Picard Check (Suppressing full output)
+echo "picard help check..."
 picard -h >/dev/null || true
 
+# VEP Check
 echo "vep version:"
 vep --help | head -n 5 || true
-# 额外：验证 Perl 依赖（List::MoreUtils）
+
+# Perl Dependency Check (List::MoreUtils)
 perl -e 'use List::MoreUtils qw(any all); print "Perl List::MoreUtils OK\n";' || true
 
-echo "python:"
+# Python and Hail Checks
 python -V
 python - <<'PY'
 try:
     import hail as hl
+    import pyspark
+    import py4j
     print("[OK] Hail version:", hl.__version__)
+    print("[INFO] PySpark version:", pyspark.__version__)
+    print("[INFO] Py4J version:", py4j.__version__)
 except Exception as e:
     print("[WARN] Hail import failed:", e)
 PY
 
-# 为 Spark 指定解释器（可选）
+# Export for Spark/Hail (Optional but good practice)
 export PYSPARK_PYTHON="$(command -v python)"
 echo "PYSPARK_PYTHON=${PYSPARK_PYTHON}"
 
